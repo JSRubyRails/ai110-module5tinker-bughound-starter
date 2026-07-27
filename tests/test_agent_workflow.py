@@ -38,6 +38,26 @@ def test_offline_mode_proposes_logging_fix_for_print():
     assert "logging.info(" in fixed
 
 
+def test_no_print_false_positive_or_comment_corruption_on_comment_only_code():
+    # GUARDRAIL: "print(" mentioned inside a comment is not real code, so it must
+    # not be flagged as a Code Quality issue nor rewritten by the fixer.
+    # MockClient forces the offline heuristic path (no API calls / no quota use).
+    agent = BugHoundAgent(client=MockClient())
+    code = (
+        "# Helper notes for reviewers.\n"
+        "# Do not use print( for logging in production code.\n"
+    )
+    result = agent.run(code)
+
+    # Decision 1: the agent declines to treat the commented print( as an issue.
+    assert not any(issue.get("type") == "Code Quality" for issue in result["issues"])
+
+    # Decision 2: the agent does not perform a destructive edit on the comment.
+    fixed = result["fixed_code"]
+    assert "logging.info(" not in fixed          # comment was not rewritten
+    assert "print(" in fixed                      # original comment text preserved
+
+
 def test_mock_client_forces_llm_fallback_to_heuristics_for_analysis():
     # MockClient returns non-JSON for analyzer prompts, so agent should fall back.
     agent = BugHoundAgent(client=MockClient())

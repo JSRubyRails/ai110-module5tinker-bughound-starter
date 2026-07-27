@@ -74,22 +74,37 @@ class BugHoundAgent:
         # Load prompt templates from prompts/ folder
         system_prompt = _load_prompt("analyzer_system.txt")
         user_template = _load_prompt("analyzer_user.txt")
-        user_prompt = user_template.replace("{{CODE}}", code_snippet)
+        base_user_prompt = user_template.replace("{{CODE}}", code_snippet)
 
-        # UPDATED: Added exception handling for API errors/rate limits
-        try:
-            raw = self.client.complete(system_prompt=system_prompt, user_prompt=user_prompt)
-        except Exception as e:
-            self._log("ANALYZE", f"API Error: {str(e)}. Falling back to heuristics.")
-            return self._heuristic_analyze(code_snippet)
+        # RELIABILITY: give the LLM one stricter retry before downgrading to the
+        # weaker heuristic analyzer. Malformed-but-recoverable JSON is the most
+        # common LLM failure; a single corrective re-ask recovers most cases
+        # while capping worst-case API usage at 2 calls (mindful of free-tier quota).
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            user_prompt = base_user_prompt
+            if attempt > 1:
+                user_prompt += (
+                    "\n\nReminder: return ONLY a valid JSON array of issue objects. "
+                    "No markdown, no backticks, no commentary. If there are no issues, return []."
+                )
 
-        issues = self._parse_json_array_of_issues(raw)
+            # UPDATED: Added exception handling for API errors/rate limits
+            try:
+                raw = self.client.complete(system_prompt=system_prompt, user_prompt=user_prompt)
+            except Exception as e:
+                self._log("ANALYZE", f"API Error: {str(e)}. Falling back to heuristics.")
+                return self._heuristic_analyze(code_snippet)
 
-        if issues is None:
-            self._log("ANALYZE", "LLM output was not parseable JSON. Falling back to heuristics.")
-            return self._heuristic_analyze(code_snippet)
+            issues = self._parse_json_array_of_issues(raw)
+            if issues is not None:
+                return issues
 
-        return issues
+            if attempt < max_attempts:
+                self._log("ANALYZE", "LLM output was not parseable JSON. Retrying once with stricter instructions.")
+
+        self._log("ANALYZE", "LLM output still not parseable after retry. Falling back to heuristics.")
+        return self._heuristic_analyze(code_snippet)
 
     def propose_fix(self, code_snippet: str, issues: List[Dict[str, str]]) -> str:
         if not issues:
@@ -128,7 +143,13 @@ class BugHoundAgent:
     def _heuristic_analyze(self, code: str) -> List[Dict[str, str]]:
         issues: List[Dict[str, str]] = []
 
-        if "print(" in code:
+        # GUARDRAIL: only flag print( when it appears in executable code, not
+        # inside a comment. Naive substring matching used to flag "print("
+        # mentioned in a comment, and the fixer then corrupted that comment.
+        # (Best-effort: strips '#' comments; does not account for '#' in strings.)
+        code_without_comments = self._strip_comments(code)
+
+        if "print(" in code_without_comments:
             issues.append(
                 {
                     "type": "Code Quality",
@@ -227,6 +248,16 @@ class BugHoundAgent:
         if match:
             return match.group(1)
         return text
+
+    def _strip_comments(self, code: str) -> str:
+        """Return the code with '#' comments removed (line-based, best-effort)."""
+        lines = []
+        for line in code.splitlines():
+            hash_index = line.find("#")
+            if hash_index != -1:
+                line = line[:hash_index]
+            lines.append(line)
+        return "\n".join(lines)
 
     def _can_call_llm(self) -> bool:
         return self.client is not None and hasattr(self.client, "complete")

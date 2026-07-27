@@ -80,7 +80,16 @@ def assess_risk(
     # ----------------------------
     # Auto-fix policy
     # ----------------------------
-    should_autofix = level == "low"
+    # RELIABILITY: tighten auto-fix. A low numeric score alone is not enough —
+    # a single Medium issue only deducts 20 (score 80 -> level "low"), which
+    # would otherwise auto-apply a fix for a non-trivial problem. Require that
+    # no Medium/High severity issue is present before auto-applying.
+    severities = {str(i.get("severity", "")).lower() for i in issues}
+    has_serious_issue = "high" in severities or "medium" in severities
+    should_autofix = level == "low" and not has_serious_issue
+
+    if level == "low" and has_serious_issue:
+        reasons.append("Auto-fix withheld: a medium/high severity issue needs human review.")
 
     if not reasons:
         reasons.append("No significant risks detected.")
